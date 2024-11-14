@@ -1,0 +1,25 @@
+{
+    "aws": {
+        "region": "us-east-1",
+        "credentials": {
+            "accessKeyId": "",
+            "secretAccessKey": ""
+        },
+        "endpoint": null,
+        "forcePathStyle": false,
+        "useArnRegion": true
+    },
+    "buckets": [
+        "backup-bucket-1",
+        "backup-bucket-2"
+    ],
+    "prefix": "",
+    "retention": {
+        "yearlyBackups": 1,
+        "monthlyBackups": 12,
+        "weeklyBackups": 4,
+        "differentialBackups": 7
+    },
+    "dryRun": true,
+    "deleteNonRetained": true
+}
