@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import ObjectsToCsv from "objects-to-csv";
 
 const debug = false;
 
@@ -20,31 +21,31 @@ dayjs.extend(weekOfYear);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-function loadConfig() {
-    const defaultConfig = {
-        aws: {
-            credentials: {
-                accessKeyId: '',
-                secretAccessKey: ''
-            },
-            region: 'us-east-1',
-            endpoint: null,
-            forcePathStyle: false,
-            useArnRegion: true
+const defaultConfig = {
+    aws: {
+        credentials: {
+            accessKeyId: '',
+            secretAccessKey: ''
         },
-        buckets: [],
-        prefix: '',
-        retention: {
-            yearlyBackups: 1,
-            monthlyBackups: 12,
-            weeklyBackups: 4,
-            differentialBackups: 7
-        },
-        dryRun: true,
-        deleteNonRetained: false
-    };
+        region: 'us-east-1',
+        endpoint: null,
+        forcePathStyle: false,
+        useArnRegion: true
+    },
+    buckets: [],
+    prefix: '',
+    retention: {
+        yearlyBackups: 1,
+        monthlyBackups: 12,
+        weeklyBackups: 4,
+        differentialBackups: 7
+    },
+    dryRun: true,
+    deleteNonRetained: false
+};
 
-    let config = { ...defaultConfig };
+function loadConfig() {
+    let config = {};
 
     // Load base config
     const configPath = join(__dirname, 'config.json');
@@ -57,7 +58,11 @@ function loadConfig() {
     const localConfigPath = join(__dirname, 'config.local.json');
     if (existsSync(localConfigPath)) {
         const localConfigFile = JSON.parse(readFileSync(localConfigPath, 'utf8'));
-        config = { ...config, ...localConfigFile };
+        if (Array.isArray(localConfigFile)) {
+            config = localConfigFile.map(localConfigEntry => {
+                return { ...config, ...localConfigEntry }
+            });
+        }
     }
 
     return config;
@@ -384,7 +389,7 @@ async function processBackups(config) {
             console.log(`\nProcessing bucket: ${bucketName}`);
 
             try {
-                const listFilename = `${bucketName}.list.json`;
+                const listFilename = `output/${bucketName}.list.json`;
                 let objects;
                 if (debug === true && existsSync(listFilename)) {
                     objects = JSON.parse(readFileSync(listFilename));
@@ -432,41 +437,68 @@ async function processBackups(config) {
 }
 
 async function main() {
-    try {
-        const config = loadConfig();
+    const finalTable = [];
+    const resultSets = [];
 
-        if (!config.buckets || config.buckets.length === 0) {
-            throw new Error('No buckets configured. Please check your config files.');
+    try {
+        let configs = loadConfig();
+
+        if (!Array.isArray(configs)) {
+            configs = [configs];
         }
 
-        console.log('Configuration loaded:', {
-            ...config,
-            aws: {
-                ...config.aws,
-                credentials: {
-                    accessKeyId: '***',
-                    secretAccessKey: '***'
+        for (let config of configs) {
+            config = { ...defaultConfig, ...config };
+            if (!config.buckets || config.buckets.length === 0) {
+                throw new Error('No buckets configured. Please check your config files.');
+            }
+
+            console.log('Configuration loaded:', {
+                ...config,
+                aws: {
+                    ...config.aws,
+                    credentials: {
+                        accessKeyId: '***',
+                        secretAccessKey: '***'
+                    }
+                }
+            });
+
+            if (config.dryRun) {
+                console.log('\nDRY RUN MODE - No deletions will be performed');
+            }
+
+            const results = await processBackups(config);
+
+            console.log('\nTotal Summary:', results.totalSummary);
+
+            if (config.dryRun && config.deleteNonRetained) {
+                console.log('\nTo perform actual deletions, set dryRun: false in your config');
+            }
+
+            resultSets.push(results)
+            for (const bucket in results.byBucket) {
+                const { byObject } = results.byBucket[bucket].summary;
+                for (const db in byObject) {
+                    const summary = byObject[db];
+                    summary.retainedBackups.forEach(backup => {
+                        finalTable.push({
+                            bucket,
+                            db,
+                            key: backup.key
+                        })
+                    });
                 }
             }
-        });
-
-        if (config.dryRun) {
-            console.log('\nDRY RUN MODE - No deletions will be performed');
         }
-
-        const results = await processBackups(config);
-
-        console.log('\nTotal Summary:', results.totalSummary);
-
-        if (config.dryRun && config.deleteNonRetained) {
-            console.log('\nTo perform actual deletions, set dryRun: false in your config');
-        }
-
-        return results;
 
     } catch (error) {
         console.error('Error in main process:', error);
         throw error;
+    }
+    return {
+        resultSets,
+        finalTable
     }
 }
 
@@ -480,4 +512,7 @@ export {
     main
 };
 
-main();
+const final = await main();
+const csv = new ObjectsToCsv(final.finalTable);
+await csv.toDisk('./output/backup-list.csv');
+//console.table(final.finalTable);
