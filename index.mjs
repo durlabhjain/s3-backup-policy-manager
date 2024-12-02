@@ -12,16 +12,16 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import ObjectsToCsv from "objects-to-csv";
+import cron from 'node-cron';
 
 const debug = false;
 
+const logger = console;
+
 dayjs.extend(weekOfYear);
 
-// Get current file's directory (ESM equivalent of __dirname)
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 const defaultConfig = {
+    cron: "* */4 * * *",
     aws: {
         credentials: {
             accessKeyId: '',
@@ -48,14 +48,14 @@ function loadConfig() {
     let config = {};
 
     // Load base config
-    const configPath = join(__dirname, 'config.json');
+    const configPath = './config.json';
     if (existsSync(configPath)) {
         const configFile = JSON.parse(readFileSync(configPath, 'utf8'));
         config = { ...config, ...configFile };
     }
 
     // Load local config overrides
-    const localConfigPath = join(__dirname, 'config.local.json');
+    const localConfigPath = './config.local.json';
     if (existsSync(localConfigPath)) {
         const localConfigFile = JSON.parse(readFileSync(localConfigPath, 'utf8'));
         if (Array.isArray(localConfigFile)) {
@@ -155,7 +155,7 @@ async function listS3Objects(s3Client, bucketName, prefix = '') {
 
             continuationToken = response.NextContinuationToken;
         } catch (error) {
-            console.error(`Error listing objects in bucket ${bucketName}:`, error);
+            logger.error(`Error listing objects in bucket ${bucketName}:`, error);
             throw error;
         }
     } while (continuationToken);
@@ -199,7 +199,7 @@ async function deleteS3Objects(s3Client, bucketName, keys) {
                 })));
             }
         } catch (error) {
-            console.error(`Error during batch deletion in bucket ${bucketName}:`, error);
+            logger.error(`Error during batch deletion in bucket ${bucketName}:`, error);
             deletionResults.failed.push(...chunk.map(key => ({
                 key,
                 error: error.message,
@@ -436,69 +436,69 @@ async function processBackups(config) {
     return allResults;
 }
 
-async function main() {
+async function prune(config) {
     const finalTable = [];
-    const resultSets = [];
 
-    try {
-        let configs = loadConfig();
+    const results = await processBackups(config);
 
-        if (!Array.isArray(configs)) {
-            configs = [configs];
-        }
+    logger.log('\nTotal Summary:', results.totalSummary);
 
-        for (let config of configs) {
-            config = { ...defaultConfig, ...config };
-            if (!config.buckets || config.buckets.length === 0) {
-                throw new Error('No buckets configured. Please check your config files.');
-            }
-
-            console.log('Configuration loaded:', {
-                ...config,
-                aws: {
-                    ...config.aws,
-                    credentials: {
-                        accessKeyId: '***',
-                        secretAccessKey: '***'
-                    }
-                }
-            });
-
-            if (config.dryRun) {
-                console.log('\nDRY RUN MODE - No deletions will be performed');
-            }
-
-            const results = await processBackups(config);
-
-            console.log('\nTotal Summary:', results.totalSummary);
-
-            if (config.dryRun && config.deleteNonRetained) {
-                console.log('\nTo perform actual deletions, set dryRun: false in your config');
-            }
-
-            resultSets.push(results)
-            for (const bucket in results.byBucket) {
-                const { byObject } = results.byBucket[bucket].summary;
-                for (const db in byObject) {
-                    const summary = byObject[db];
-                    summary.retainedBackups.forEach(backup => {
-                        finalTable.push({
-                            bucket,
-                            db,
-                            key: backup.key
-                        })
-                    });
-                }
-            }
-        }
-
-    } catch (error) {
-        console.error('Error in main process:', error);
-        throw error;
+    if (config.dryRun && config.deleteNonRetained) {
+        logger.log('\nTo perform actual deletions, set dryRun: false in your config');
     }
-    return {
-        resultSets,
-        finalTable
+
+    for (const bucket in results.byBucket) {
+        const { byObject } = results.byBucket[bucket].summary;
+        for (const db in byObject) {
+            const summary = byObject[db];
+            summary.retainedBackups.forEach(backup => {
+                finalTable.push({
+                    bucket,
+                    db,
+                    key: backup.key
+                })
+            });
+        }
+    }
+
+    return finalTable;
+}
+
+function main() {
+    let configs = loadConfig();
+
+    if (!Array.isArray(configs)) {
+        configs = [configs];
+    }
+
+    for (let config of configs) {
+        config = { ...defaultConfig, ...config };
+        if (!config.buckets || config.buckets.length === 0) {
+            throw new Error('No buckets configured. Please check your config files.');
+        }
+        logger.info('Configuration loaded:', {
+            ...config,
+            aws: {
+                ...config.aws,
+                credentials: {
+                    accessKeyId: '***',
+                    secretAccessKey: '***'
+                }
+            }
+        });
+
+        cron.schedule(config.cron, () => {
+            const title = `${config.aws.endpoint} - ${config.buckets.join(',')}`
+            logger.info(`Running ${title}....`);
+            if (config.dryRun) {
+                logger.debug('DRY RUN MODE - No deletions will be performed');
+            }
+            try {
+                prune(config);
+            } catch (err) {
+                logger.error(err);
+            }
+        });
     }
 }
 
@@ -512,7 +512,7 @@ export {
     main
 };
 
-const final = await main();
-const csv = new ObjectsToCsv(final.finalTable);
-await csv.toDisk('./output/backup-list.csv');
+main();
+//const csv = new ObjectsToCsv(final.finalTable);
+//await csv.toDisk('./output/backup-list.csv');
 //console.table(final.finalTable);
