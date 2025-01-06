@@ -8,9 +8,6 @@ import weekOfYear from 'dayjs/plugin/weekOfYear.js';
 import { readFileSync } from 'fs';
 import { writeFileSync } from "fs";
 import { existsSync } from 'fs';
-import { join } from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import ObjectsToCsv from "objects-to-csv";
 import cron from 'node-cron';
 
@@ -38,7 +35,8 @@ const defaultConfig = {
         yearlyBackups: 1,
         monthlyBackups: 12,
         weeklyBackups: 4,
-        differentialBackups: 7
+        differentialBackups: 7,
+        fullBackups: 1
     },
     dryRun: true,
     deleteNonRetained: false
@@ -247,19 +245,34 @@ function applyRetentionPolicy(backups, retentionConfig) {
             yearlyBackups: 0,
             monthlyBackups: 0,
             weeklyBackups: 0,
-            differentialBackups: 0
+            differentialBackups: 0,
+            fullBackups: 0  // New: Track retained full backups
         };
 
-        // Track what we've retained
         const retainedYears = new Set();
         const retainedMonths = new Set();
         const retainedWeeks = new Set();
         let diffCount = 0;
+        let fullCount = 0;  // New: Track count of retained full backups
 
-        // Process full backups first for year/ month (retain oldest)
+        // First pass: Retain newest full backups up to the limit
+        const reversedGroups = [...sortedBackupGroups].reverse();
+        reversedGroups.forEach(backupGroup => {
+            const backup = backupGroup[0];
+            if (backup.isFullBackup && fullCount < retentionConfig.fullBackups) {
+                backupGroup.forEach(part => {
+                    objectRetained.add(part.key);
+                    retainedBackups.add(part.key);
+                });
+                fullCount++;
+                objectSummary.fullBackups++;
+            }
+        });
+
+        // Second pass: Process yearly/monthly retention for remaining full backups
         sortedBackupGroups.forEach(backupGroup => {
-            const backup = backupGroup[0]; // Use first part for metadata
-            if (backup.isFullBackup) {
+            const backup = backupGroup[0];
+            if (backup.isFullBackup && !objectRetained.has(backup.key)) {
                 let shouldRetain = false;
 
                 // 1. Yearly retention
@@ -289,11 +302,11 @@ function applyRetentionPolicy(backups, retentionConfig) {
             }
         });
 
-        // Process latest weekly backups
-        sortedBackupGroups.reverse().forEach(backupGroup => {
-            const backup = backupGroup[0]; // Use first part for metadata
+        // Third pass: Process weekly backups and differential backups
+        reversedGroups.forEach(backupGroup => {
+            const backup = backupGroup[0];
             let shouldRetain = false;
-            if (backup.isFullBackup) {
+            if (backup.isFullBackup && !objectRetained.has(backup.key)) {
                 // 3. Weekly retention
                 const weekKey = backup.getWeekKey();
                 if (!retainedWeeks.has(weekKey) &&
