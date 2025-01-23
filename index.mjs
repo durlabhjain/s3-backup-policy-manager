@@ -10,6 +10,10 @@ import { writeFileSync } from "fs";
 import { existsSync } from 'fs';
 import ObjectsToCsv from "objects-to-csv";
 import cron from 'node-cron';
+import BackupObject from "./backup-object.mjs";
+import FindBlobs from "./find-blobs.mjs";
+import ActionBase from "./action-base.mjs";
+import utility from "./utility.mjs";
 
 const debug = false;
 
@@ -64,43 +68,6 @@ function loadConfig() {
     }
 
     return config;
-}
-
-class BackupObject {
-    constructor(key, bucketName) {
-        const parts = key.split('/');
-        const filename = parts[1] || parts[0];
-        const matches = filename.match(/(.+)_(\d{8})_(\d{6})-(\w+)(?:-(\d+))?\..*$/);
-
-        if (!matches) throw new Error(`Invalid backup name format: ${key}`);
-
-        this.key = key;
-        this.bucketName = bucketName;
-        this.objectName = matches[1];        // e.g., "AnalysisCompanyMaster"
-        const dateTimeStr = `${matches[2]}${matches[3]}`;
-        this.datetime = dayjs(dateTimeStr, 'YYYYMMDDHHMMSS');
-        if (!this.datetime.isValid()) {
-            throw new Error(`Invalid date/time in backup name: ${dateTimeStr}`);
-        }
-        this.date = matches[2];
-        this.time = matches[3];
-        this.type = parts[0].split("-")[1].toLowerCase();
-        this.part = matches[5] || '1';       // If no part number, assume it's single file
-        this.backupId = `${this.objectName}_${this.date}_${this.time}`; // Unique identifier for this backup
-        this.year = this.datetime.year();
-        this.month = this.datetime.month() + 1; // dayjs months are 0-based
-        this.week = this.datetime.week();
-        this.isFullBackup = this.type === 'full';
-    }
-
-    // Helper method to get formatted date strings
-    getMonthKey() {
-        return this.datetime.format('YYYY-MM');
-    }
-
-    getWeekKey() {
-        return this.datetime.format('YYYY-[W]WW');
-    }
 }
 
 function groupBackupsByObject(backupObjects) {
@@ -372,21 +339,9 @@ function applyRetentionPolicy(backups, retentionConfig) {
         summary: retentionSummary
     };
 }
+
 async function processBackups(config) {
-    // Initialize S3 client with configuration
-    const s3Config = {
-        region: config.aws.region,
-        credentials: config.aws.credentials
-    };
-
-    // Add optional S3 configurations
-    if (config.aws.endpoint) {
-        s3Config.endpoint = config.aws.endpoint;
-        s3Config.forcePathStyle = config.aws.forcePathStyle ?? true;
-        s3Config.useArnRegion = config.aws.useArnRegion ?? true;
-    }
-
-    const s3Client = new S3Client(s3Config);
+    const s3Client = utility.createS3Client(config);
 
     const allResults = {
         byBucket: {},
@@ -477,18 +432,8 @@ async function prune(config) {
     return finalTable;
 }
 
-function main() {
-    let configs = loadConfig();
-
-    if (!Array.isArray(configs)) {
-        configs = [configs];
-    }
-
-    for (let config of configs) {
-        config = { ...defaultConfig, ...config };
-        if (!config.buckets || config.buckets.length === 0) {
-            throw new Error('No buckets configured. Please check your config files.');
-        }
+class PruneBackup extends ActionBase {
+    async run(config) {
         logger.info('Configuration loaded:', {
             ...config,
             aws: {
@@ -513,6 +458,44 @@ function main() {
             }
         });
     }
+};
+
+const modes = {
+    schedulePrune: PruneBackup,
+    findBlobs: FindBlobs
+};
+
+async function main() {
+    // convert arguments to an object
+    const args = process.argv.slice(2).reduce((acc, arg) => {
+        const [key, value] = arg.split('=');
+        acc[key] = value;
+        return acc;
+    }, {});
+
+    const { mode = "schedulePrune", ...options } = args;
+
+    if (!modes[mode]) {
+        throw new Error(`Invalid mode: ${mode}`);
+    }
+
+    let configs = loadConfig();
+
+    if (!Array.isArray(configs)) {
+        configs = [configs];
+    }
+
+    const action = new modes[mode](options);
+
+    for (let config of configs) {
+        config = { ...defaultConfig, ...config };
+        if (!config.buckets || config.buckets.length === 0) {
+            throw new Error('No buckets configured. Please check your config files.');
+        }
+        await action.run(config);
+    }
+
+    await action.cleanup();
 }
 
 export {
@@ -526,6 +509,7 @@ export {
 };
 
 main();
+//findBlobs('sql-indexing', /.*Full\/USA.*-01.BAK/, '');
 //const csv = new ObjectsToCsv(final.finalTable);
 //await csv.toDisk('./output/backup-list.csv');
 //console.table(final.finalTable);
