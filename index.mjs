@@ -1,8 +1,11 @@
 import {
     S3Client,
     ListObjectsV2Command,
-    DeleteObjectsCommand
+    DeleteObjectsCommand,
+    GetObjectCommand,
+    PutObjectCommand
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import dayjs from 'dayjs';
 import weekOfYear from 'dayjs/plugin/weekOfYear.js';
 import { readFileSync } from 'fs';
@@ -460,9 +463,30 @@ class PruneBackup extends ActionBase {
     }
 };
 
+class GenerateSignedUrls extends ActionBase {
+    async run(config, args) {
+        const { bucket, blob, expiresIn = 24 * 60 * 60 } = args;
+        if (!config.buckets.includes(bucket)) {
+            logger.info(`Bucket ${bucket} not found in ${config.aws.endpoint}`);
+            return;
+        }
+
+        const s3Client = utility.createS3Client(config);
+        const getObjectParams = {
+            Bucket: bucket,
+            Key: blob, // The path to your object in S3
+        };
+        const getCommand = new GetObjectCommand(getObjectParams);
+        const signedUrl = await getSignedUrl(s3Client, getCommand, { expiresIn });
+        logger.info("Signed URL for download:", signedUrl);
+
+    }
+}
+
 const modes = {
     schedulePrune: PruneBackup,
-    findBlobs: FindBlobs
+    findBlobs: FindBlobs,
+    generateSignedUrls: GenerateSignedUrls
 };
 
 async function main() {
@@ -492,7 +516,7 @@ async function main() {
         if (!config.buckets || config.buckets.length === 0) {
             throw new Error('No buckets configured. Please check your config files.');
         }
-        await action.run(config);
+        await action.run(config, args);
     }
 
     await action.cleanup();
