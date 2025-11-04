@@ -1,12 +1,11 @@
 import utility from "./utility.mjs";
 import ActionBase from "./action-base.mjs";
+import fs from "fs/promises";
 import {
     ListObjectsV2Command
 } from "@aws-sdk/client-s3";
 
 class FindBlobs extends ActionBase {
-
-    results = [];
 
     constructor({ bucket, searchPattern, prefix = "", logger = console }) {
         super();
@@ -48,21 +47,18 @@ class FindBlobs extends ActionBase {
     }
 
     async run(config) {
-        const { bucket, searchPattern, prefix } = this;
-        if (!config.buckets.includes(bucket)) {
-            this.logger.info(`Skipping ${config.aws.endpoint} with buckets ${config.buckets}`);
-            return;
-        }
-        this.logger.info(`Processing ${config.aws.endpoint} with bucket ${bucket}`);
+        const { searchPattern, prefix } = this;
         const client = utility.createS3Client(config);
-        const results = await this.findBlobs(client, bucket, searchPattern, prefix);
-        this.results.push(...results);
+        for (const bucket of config.buckets) {
+            this.logger.info(`Processing ${config.aws.endpoint} with bucket ${bucket}`);
+            const listFile = `output/${bucket}-${config.aws.endpoint.split("://")[1]}-blobs.txt`;
+            const results = await this.findBlobs(client, bucket, searchPattern, prefix);
+            await fs.writeFile(listFile, results.join('\n'), 'utf8');
+            this.logger.info(`Wrote ${results.length} blob keys to ${listFile}`);
+        }
     }
 
     async cleanup() {
-        for (const result of this.results) {
-            console.log(result);
-        }
     }
 }
 
