@@ -1,4 +1,5 @@
 import dayjs from 'dayjs';
+const BackupTypes = ['full', 'diff'];
 
 class BackupObject {
     constructor(key, bucketName) {
@@ -18,7 +19,14 @@ class BackupObject {
         }
         this.date = matches[2];
         this.time = matches[3];
-        this.type = parts[0].split("-")[1].toLowerCase();
+        let type = parts[0].split("-")[1]?.toLowerCase();
+        if (!BackupTypes.includes(type)) {
+            type = matches[4].toLowerCase();
+        }
+        if(!BackupTypes.includes(type)) {
+            throw new Error(`Invalid backup type: ${type}`);
+        }
+        this.type = type;
         this.part = matches[5] || '1';       // If no part number, assume it's single file
         this.backupId = `${this.objectName}_${this.date}_${this.time}`; // Unique identifier for this backup
         this.year = this.datetime.year();
