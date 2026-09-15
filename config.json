@@ -19,8 +19,11 @@
         "yearlyBackups": 1,
         "monthlyBackups": 12,
         "weeklyBackups": 4,
-        "differentialBackups": 7
+        "differentialBackups": 7,
+        "fullBackups": 1,
+        "logBackups": null
     },
     "dryRun": true,
-    "deleteNonRetained": true
+    "deleteNonRetained": true,
+    "provider": "aws"
 }

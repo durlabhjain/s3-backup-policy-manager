@@ -2,3 +2,4 @@ config.local.json
 node_modules
 /output
 .DS_Store
+config.*.json
