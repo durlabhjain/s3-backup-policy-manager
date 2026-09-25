@@ -76,7 +76,7 @@ Dates are parsed strictly as local time with a 24-hour clock. Invalid filenames,
 | `deleteNonRetained` | `false` | Enables deletion only when the boolean `true` and `dryRun` is false. Interactive deletion still requires confirmation. |
 | `retention` | See below | Per-source retention policy. Missing fields get built-in defaults, including when a local override replaces the retention object. |
 
-Defaults above are built into the code; values in your selected config file can override them. Normal loading is built-in defaults → `config.json` → `config.local.json` → supported CLI overrides. Nested file overrides are shallow. An explicit `config=...` skips both implicit files and uses built-in defaults → selected file → CLI overrides. Only `config.local.json` is automatically gitignored; other config files with credentials must be kept out of commits manually.
+Defaults above are built into the code; values in your selected config files can override them. Normal loading is built-in defaults → `config.json` → `config.local.json` → supported CLI overrides. Nested file overrides are shallow. An explicit `config=...` skips both implicit files and uses built-in defaults → each selected configuration → CLI overrides. Selected files are processed independently, not merged together. Keep config files with credentials out of commits.
 
 ### AWS settings
 
@@ -193,7 +193,34 @@ node index.mjs mode=schedulePrune config=./config.azure.json dryRun=true
 node index.mjs mode=generateSignedUrls bucket=sql-backups blob=WHISKEY/dedicated/full/WHISKEY_dedicated_FULL_20260807_144018_1.bak expiresIn=3600
 ```
 
-`config=path` loads only that file, replacing the usual `config.json` / `config.local.json` loading. Paths are relative to the current working directory (absolute paths also work); quote the whole argument if it contains spaces. The file can contain one configuration object or an array. Missing or invalid files fail rather than falling back to the default files.
+### Selecting multiple config files (all modes)
+
+`config=` accepts a path, a wildcard pattern, a comma-separated list, or repeated arguments. These work with `prune`, `schedulePrune`, `findBlobs`, and `generateSignedUrls`:
+
+```bash
+# Schedule every matching config using its own cron expression
+node index.mjs mode=schedulePrune 'config=./config.*.json' dryRun=true
+
+# Select an explicit list
+node index.mjs mode=schedulePrune 'config=./config.tls.json,./config.coolr.json' dryRun=true
+
+# Repeat config= to combine files and patterns
+node index.mjs mode=prune config=./config.tls.json 'config=./configs/*.json' dryRun=true
+
+# Search all selected configurations
+node index.mjs mode=findBlobs 'config=./configs/**/*.json' searchPattern='.*FULL.*'
+
+# Generate a URL for each selected config containing the requested bucket/container
+node index.mjs mode=generateSignedUrls 'config=./configs/*.json' bucket=sql-backups blob=backup.bak
+```
+
+Quote wildcard arguments so the application expands them, and quote arguments containing spaces. Paths are relative to the current working directory; absolute paths also work. Wildcards use [Node.js glob syntax](https://nodejs.org/api/fs.html#fsglobsyncpattern-options), including `*`, `?`, and recursive `**`. Use repeated `config=` arguments for literal filenames containing commas.
+
+Selections are processed in argument/list order, with each wildcard's matches sorted by path. Files are deduplicated by their real path, including overlapping patterns and symlinks. Each file can contain one configuration object or a nonempty array; entries retain their array order. Every entry receives the built-in defaults and supported CLI overrides such as `dryRun=true` independently.
+
+Explicit selections replace the usual `config.json` / `config.local.json` loading. Every selector must match at least one file; missing files, unmatched patterns, malformed JSON, and invalid object/array shapes fail before any mode starts. All configurations must specify buckets/containers, and cron mode validates all schedules before registering jobs. Without `config=`, the usual implicit loading remains in effect.
+
+One-shot modes process configurations sequentially. Cron mode loads files once at startup and registers a separate job per entry using its `cron` expression (or the built-in default); restart to pick up changed files or new wildcard matches. Existing output filenames still apply, so configurations targeting the same provider and bucket/container may overwrite each other's report files.
 
 `dryRun=true` or `dryRun=false` overrides the file setting for every configuration in the run. If omitted, the file setting is used (default `true`). Other values are rejected. `dryRun=false` still requires `deleteNonRetained: true` in the file before deletion can occur.
 

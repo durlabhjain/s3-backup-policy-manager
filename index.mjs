@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, globSync, statSync, realpathSync } from 'node:fs';
 import { createStorage, storageNames } from './storage.mjs';
 import { listS3Objects, deleteS3Objects } from './s3-operations.mjs';
 import dayjs from 'dayjs';
@@ -552,11 +552,49 @@ const modes = {
 };
 
 function parseCliArgs(argv) {
-    return Object.fromEntries(argv.map(arg => {
+    const args = {};
+    for (const arg of argv) {
         const separator = arg.indexOf('=');
         if (separator < 1) throw new Error(`Expected key=value argument: ${arg}`);
-        return [arg.slice(0, separator), arg.slice(separator + 1)];
-    }));
+        const key = arg.slice(0, separator), value = arg.slice(separator + 1);
+        if (key === 'config' && args.config !== undefined) {
+            args.config = [args.config, value].flat();
+        } else {
+            Object.defineProperty(args, key, { value, enumerable: true, configurable: true, writable: true });
+        }
+    }
+    return args;
+}
+
+function resolveConfigFiles(selection) {
+    const files = new Set();
+    for (const value of [selection].flat()) {
+        if (typeof value !== 'string' || !value.trim()) throw new Error('config must specify a file path or pattern');
+        // Existing literal paths may contain commas or glob metacharacters.
+        const selectors = [];
+        if (existsSync(value)) selectors.push(value);
+        else {
+            let start = 0, depth = 0;
+            for (let i = 0; i < value.length; i++) {
+                if ('{[('.includes(value[i])) depth++;
+                if ('}])'.includes(value[i])) depth--;
+                if (value[i] === ',' && depth === 0) {
+                    selectors.push(value.slice(start, i).trim());
+                    start = i + 1;
+                }
+            }
+            selectors.push(value.slice(start).trim());
+        }
+        for (const selector of selectors) {
+            if (!selector) throw new Error('config must specify a file path or pattern for every list entry');
+            const matches = existsSync(selector) ? [selector] : globSync(selector).sort();
+            const matchedFiles = matches.filter(path => statSync(path).isFile());
+            if (!matchedFiles.length) throw new Error(`No config files matched: ${selector}`);
+            for (const path of matchedFiles) files.add(realpathSync(path));
+        }
+    }
+    if (!files.size) throw new Error('config must specify at least one file path or pattern');
+    return [...files];
 }
 
 function resolveConfigs(args) {
@@ -567,7 +605,18 @@ function resolveConfigs(args) {
         }
         overrides.dryRun = args.dryRun === 'true';
     }
-    const loaded = loadConfig(args.config);
+    const loaded = args.config === undefined ? loadConfig() : resolveConfigFiles(args.config).flatMap(path => {
+        try {
+            const value = loadConfig(path);
+            const entries = Array.isArray(value) ? value : [value];
+            if (!entries.length || entries.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry))) {
+                throw new Error('Configuration must be an object or a nonempty array of objects');
+            }
+            return entries;
+        } catch (error) {
+            throw new Error(`Unable to load config ${path}: ${error.message}`, { cause: error });
+        }
+    });
     return (Array.isArray(loaded) ? loaded : [loaded]).map(config => {
         if (!config || typeof config !== 'object' || Array.isArray(config)) {
             throw new Error('Configuration must be an object or an array of objects');
@@ -576,8 +625,8 @@ function resolveConfigs(args) {
     });
 }
 
-async function main() {
-    const args = parseCliArgs(process.argv.slice(2));
+async function main(argv = process.argv.slice(2)) {
+    const args = parseCliArgs(argv);
 
     const { mode = "findBlobs", ...options } = args;
 
@@ -587,23 +636,30 @@ async function main() {
 
     const configs = resolveConfigs(args);
 
-    const action = new modes[mode](options);
-
     for (const config of configs) {
         if (storageNames(config).length === 0) {
             throw new Error('No buckets/containers configured. Please check your config files.');
         }
-        const result = await action.run(config, args);
-        if (result?.reviewStopped) break;
+        if (mode === 'schedulePrune' && !cron.validate(config.cron)) {
+            throw new Error(`Invalid cron schedule: ${config.cron}`);
+        }
     }
-
-    await action.cleanup();
+    const action = new modes[mode](options);
+    try {
+        for (const config of configs) {
+            const result = await action.run(config, args);
+            if (result?.reviewStopped) break;
+        }
+    } finally {
+        await action.cleanup();
+    }
 }
 
 export {
     loadConfig,
     parseCliArgs,
     resolveConfigs,
+    resolveConfigFiles,
     BackupObject,
     applyRetentionPolicy,
     listS3Objects,
