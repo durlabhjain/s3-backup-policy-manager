@@ -87,7 +87,7 @@ export class JobLogging {
                     const path = join(this.file.directory, name);
                     const date = match ? new Date(`${match[1]}T00:00:00Z`) : null;
                     if (date && Number.isFinite(date.valueOf()) && date.toISOString().slice(0, 10) === match[1] &&
-                        match[1] < cutoff.toISOString().slice(0, 10) && lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink()) unlinkSync(path);
+                        match[1] < cutoff.toISOString().slice(0, 10) && lstatSync(path).isFile()) unlinkSync(path);
                 }
                 this.day = day;
             }
