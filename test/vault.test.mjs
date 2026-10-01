@@ -43,3 +43,15 @@ test('application defaults cannot authorize deletion and nested settings merge w
     assert.equal(result.azure.accountName, 'name'); assert.deepEqual(result.containers, ['new']);
     assert.equal(expandSettings({ settings: { jobId: 'job', dryRun: false }, dryRun: true }).dryRun, true);
 });
+
+test('application refresh defers job credentials so an unrelated failed secret cannot block a healthy job', async () => {
+    const calls = [];
+    const fetchImpl = async url => {
+        calls.push(url);
+        if (!url.endsWith('/application')) throw new Error('unrelated job unavailable');
+        return { ok: true, async json() { return { data: { data: { logging: { level: 'info' }, jobs: [{ settings: 'vault:unavailable-job' }] } } }; } };
+    };
+    const app = expandSettings(await resolveVault({ settings: 'vault:application' }, { address: 'http://localhost:8200' },
+        { fetchImpl, env: { VAULT_TOKEN: 'fixture' }, deferJobs: true }));
+    assert.equal(app.jobs[0].settings, 'vault:unavailable-job'); assert.equal(calls.length, 1);
+});

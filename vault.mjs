@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { mergeConfig } from './application-config.mjs';
 // Secret references are resolved in memory before any storage client is created.
-export async function resolveVault(config, settings = {}, { fetchImpl = fetch, env = process.env } = {}) {
+export async function resolveVault(config, settings = {}, { fetchImpl = fetch, env = process.env, deferJobs = false } = {}) {
     const cache = new Map();
     let token;
     let address;
@@ -26,7 +26,8 @@ export async function resolveVault(config, settings = {}, { fetchImpl = fetch, e
             const result = Object.create(null);
             for (const [key, item] of Object.entries(value)) {
                 if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Unsafe configuration key');
-                result[key] = await expand(item, active, depth + 1);
+                // Application refresh must not resolve credentials belonging to unrelated jobs.
+                result[key] = deferJobs && key === 'jobs' ? item : await expand(item, active, depth + 1);
             }
             return result;
         }

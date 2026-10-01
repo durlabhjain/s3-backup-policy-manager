@@ -638,7 +638,7 @@ async function main(argv = process.argv.slice(2)) {
 
     const rawApp = loadApplicationConfig(args.appConfig, args.appConfig !== undefined);
     if (JSON.stringify(rawApp.vault || {}).includes('vault:')) throw new Error('Vault bootstrap settings cannot contain secret references');
-    const app = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault)));
+    const app = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault, { deferJobs: true })));
     validateLogging(app);
     const applicationJobs = args.config === undefined && app.jobs !== undefined;
     const sources = applicationJobs ? rawApp.jobs || app.jobs : resolveConfigs(args, undefined, true);
@@ -693,7 +693,7 @@ async function main(argv = process.argv.slice(2)) {
             const runId = randomUUID(), started = performance.now();
             let currentApp, currentConfig, logging;
             try {
-                currentApp = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault)));
+                currentApp = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault, { deferJobs: true })));
                 currentConfig = await resolveJob(applicationJobs ? (rawApp.jobs || currentApp.jobs)[configs.indexOf(config)] : sources[configs.indexOf(config)], currentApp);
                 if ((currentConfig.jobId || config.jobId) !== config.jobId || (currentConfig.policy || 'sql-backup-retention') !== config.policy || currentConfig.provider !== config.provider)
                     throw new Error('Job identity, provider or policy changed; restart required');
