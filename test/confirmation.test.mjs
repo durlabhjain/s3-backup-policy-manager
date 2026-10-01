@@ -58,3 +58,15 @@ test('EOF and Ctrl-C cancel confirmation', async () => {
         input.destroy(); output.destroy();
     }
 });
+
+test('container confirmation explicitly names containers and their contents', async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    input.isTTY = output.isTTY = true;
+    let prompt = '';
+    output.on('data', chunk => { prompt += chunk; });
+    const result = confirmDeletion({ count: 2, resourceType: 'containers' }, input, output);
+    input.write('DELETE\n');
+    assert.equal(await result, true);
+    assert.match(prompt, /Delete 2 listed Azure containers and ALL their contents/);
+    input.destroy(); output.destroy();
+});

@@ -58,3 +58,23 @@ test('a stalled receiver has a bounded request timeout and does not fail complet
     const started = performance.now(); await assert.doesNotReject(logging.close());
     assert.ok(performance.now() - started < 4000);
 });
+
+test('file sink and shutdown failures include redacted diagnostics without recursive logging', async t => {
+    const directory = mkdtempSync(join(tmpdir(), 'logging-failure-'));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const failures = [];
+    const logging = new JobLogging({ logging: { file: { enabled: true, directory, retentionDays: 1 } } }, {
+        consoleOutput: { ...quiet, error(...args) { failures.push(args); } },
+        redact: secretRedactor({ token: 'fixture-secret' })
+    });
+    rmSync(directory, { recursive: true });
+    logging.logger({}).info('trigger file failure');
+    assert.equal(failures[0][0], 'Daily file logging failed');
+    assert.equal(failures[0][1].error_code, 'ENOENT');
+    logging.provider = { async shutdown() { throw new Error('Shutdown rejected fixture-secret'); } };
+    await logging.close();
+    assert.equal(failures[1][0], 'Telemetry shutdown failed');
+    assert.equal(failures[1][1].error_message, 'Shutdown rejected [REDACTED]');
+    assert.ok(!JSON.stringify(failures).includes('fixture-secret'));
+    assert.equal(failures.length, 3);
+});

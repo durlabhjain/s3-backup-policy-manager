@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { loadApplicationConfig, mergeConfig, applicationDefaults } from './application-config.mjs';
 import { resolveVault, expandSettings } from './vault.mjs';
-import { JobLogging, secretRedactor, validateLogging } from './job-logging.mjs';
+import { JobLogging, secretRedactor, validateLogging, errorDetails } from './job-logging.mjs';
 import { processContainers, validateContainerPolicy } from './container-policy.mjs';
 
 const debug = false;
@@ -133,7 +133,7 @@ function applyRetentionPolicy(backups, retentionConfig = {}, output = logger, no
             } catch (e) {
                 const failure = { key: obj?.Key ?? null, bucketName: obj?.bucketName ?? null, reason: e.message };
                 parseFailures.push(failure);
-                output.error(`PROTECTED — PARSE FAILED (will NOT delete): ${JSON.stringify(failure)}`);
+                (output.warn || output.error).call(output, `PROTECTED — PARSE FAILED (will NOT delete): ${JSON.stringify(failure)}`);
                 return null;
             }
         })
@@ -288,14 +288,17 @@ function applyRetentionPolicy(backups, retentionConfig = {}, output = logger, no
     };
 }
 
-async function confirmDeletion({ provider, bucketName, count }, input = process.stdin, output = process.stdout) {
+async function confirmDeletion({ provider, bucketName, count, resourceType = 'files' }, input = process.stdin, output = process.stdout) {
     // Never accept piped input as authorization to delete backups.
     if (!input.isTTY || !output.isTTY) return false;
     const terminal = createInterface({ input, output });
     return new Promise(resolve => {
         terminal.once('close', () => resolve(false));
         terminal.once('SIGINT', () => terminal.close());
-        terminal.question(`Delete ${count} listed files from ${provider}/${bucketName}? Type DELETE to confirm: `, answer => {
+        const prompt = resourceType === 'containers'
+            ? `Delete ${count} listed Azure containers and ALL their contents? Type DELETE to confirm: `
+            : `Delete ${count} listed files from ${provider}/${bucketName}? Type DELETE to confirm: `;
+        terminal.question(prompt, answer => {
             resolve(answer.trim() === 'DELETE');
             terminal.close();
         });
@@ -468,7 +471,7 @@ async function processBackups(config, storageFactory = createStorage, {
                 allResults.totalSummary.parseFailureCount += result.summary.parseFailureCount;
 
             } catch (error) {
-                output.error(`Error processing bucket ${bucketName} (${error.name})`);
+                output.error('Error processing bucket/container %s: %s', bucketName, JSON.stringify(errorDetails(error)));
                 allResults.byBucket[bucketName] = { error: error.message };
             }
         }
@@ -704,8 +707,9 @@ async function main(argv = process.argv.slice(2)) {
                 logging = new JobLogging(currentApp, { redact: secretRedactor([currentApp, currentConfig]) });
             } catch (error) {
                 // Vault failures cannot export using credentials that could not be resolved.
-                const bootstrap = new JobLogging({ logging: app.logging, telemetry: { enabled: false } });
-                bootstrap.logger({ job_id: config.jobId, run_id: runId }).event('run_completed', { outcome: 'failed', mode: 'startup', error_type: error.name, duration_ms: Math.round(performance.now() - started) });
+                const bootstrap = new JobLogging({ logging: app.logging, telemetry: { enabled: false } }, { redact: secretRedactor([rawApp, app, sources, currentApp, currentConfig]) });
+                bootstrap.logger({ job_id: config.jobId, run_id: runId }).event('run_completed', { outcome: 'failed', mode: 'startup', ...errorDetails(error), duration_ms: Math.round(performance.now() - started) });
+                await bootstrap.close();
                 if (mode !== 'schedulePrune') process.exitCode = 1;
                 return { outcome: 'failed' };
             }
@@ -714,7 +718,7 @@ async function main(argv = process.argv.slice(2)) {
                 policy: config.policy, provider: config.provider, host_name: hostname() };
             const output = logging.logger(identity);
             output.event('run_started', { started_at: new Date().toISOString() });
-            let result, errorType;
+            let result, failure;
             try {
                 if (config.policy === 'azure-container-retention') result = await processContainers(currentConfig, {
                     output, scheduled: mode === 'schedulePrune', confirm: confirmDeletion, list: mode === 'listContainers'
@@ -725,10 +729,10 @@ async function main(argv = process.argv.slice(2)) {
                     try { result = await action.run(currentConfig, args); } finally { await action.cleanup(); }
                 }
                 result ||= { outcome: 'success', statistics: {} };
-            } catch (error) { errorType = error.name; result = { outcome: 'failed', statistics: {} }; output.error('Job failed (%s)', errorType); }
+            } catch (error) { failure = errorDetails(error); result = { outcome: 'failed', statistics: {} }; output.error('Job failed: %s', JSON.stringify(failure)); }
             finally {
                 output.event('run_completed', { outcome: result.outcome || 'success', duration_ms: Math.round(performance.now() - started),
-                    ...result.statistics, ...(errorType ? { error_type: errorType } : {}) });
+                    ...result.statistics, ...failure });
                 await logging.close();
             }
             if (mode !== 'schedulePrune' && ['failed', 'partial_failure'].includes(result.outcome)) process.exitCode = 1;

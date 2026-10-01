@@ -57,7 +57,11 @@ export async function resolveVault(config, settings = {}, { fetchImpl = fetch, e
                     const secret = (settings.kvVersion ?? 2) === 2 ? body.data?.data : body.data;
                     if (!secret || typeof secret !== 'object' || Array.isArray(secret)) throw new Error();
                     return secret;
-                } catch { throw new Error('Vault lookup failed (response and credentials redacted)'); }
+                } catch (error) {
+                    const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : '';
+                    const timeout = error?.name === 'TimeoutError' ? ' (request timed out)' : '';
+                    throw new Error(`Vault lookup failed${status}${timeout} (response and credentials redacted)`);
+                }
             })());
         }
         const secret = await cache.get(path);

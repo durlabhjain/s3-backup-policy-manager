@@ -6,6 +6,17 @@ import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 
 const levels = { debug: 5, info: 9, log: 9, warn: 13, error: 17 };
+// Select diagnostic fields instead of serializing SDK requests and credentials.
+export function errorDetails(error) {
+    const details = { error_type: error?.name || 'Error', error_message: error?.message || String(error) };
+    for (const [field, value] of Object.entries({ error_stack: error?.stack, error_code: error?.code,
+        status_code: error?.statusCode ?? error?.$metadata?.httpStatusCode,
+        request_id: error?.requestId ?? error?.details?.requestId ?? error?.$metadata?.requestId })) {
+        if (typeof value === 'string' || typeof value === 'number') details[field] = value;
+    }
+    return details;
+}
+
 export function validateLogging(app) {
     const file = app.logging?.file || {}, telemetry = app.telemetry || {};
     if (app.logging?.level && !['debug', 'info', 'warn', 'error'].includes(app.logging.level)) throw new Error('Invalid logging level');
@@ -39,7 +50,9 @@ export function secretRedactor(configs) {
 export class JobLogging {
     constructor(app, { clock = () => new Date(), redact = value => value, consoleOutput = console } = {}) {
         validateLogging(app);
-        this.app = app; this.clock = clock; this.redact = redact; this.console = consoleOutput;
+        this.app = app; this.clock = clock;
+        const redactApp = secretRedactor(app);
+        this.redact = value => redactApp(redact(value)); this.console = consoleOutput;
         this.minimum = levels[app.logging?.level || 'info'];
         this.file = app.logging?.file || {}; this.day = null;
         if (this.file.enabled) mkdirSync(this.file.directory, { recursive: true });
@@ -52,8 +65,7 @@ export class JobLogging {
             const exportRecords = exporter.export.bind(exporter);
             exporter.export = (records, callback) => exportRecords(records, result => {
                 if (result.code !== 0) {
-                    this.console.error('Telemetry export failed; inspect local logs and receiver health');
-                    this.writeFile({ timestamp: this.clock().toISOString(), level: 'error', message: 'Telemetry export failed' });
+                    this.reportFailure('Telemetry export failed', result.error || new Error(`Exporter result code: ${result.code}`));
                 }
                 callback(result);
             });
@@ -81,7 +93,13 @@ export class JobLogging {
             }
             const path = join(this.file.directory, `s3-backup-policy-manager-${day}.jsonl`);
             appendFileSync(path, JSON.stringify(record) + '\n');
-        } catch { this.console.error('Daily file logging failed (details redacted)'); }
+        } catch (error) { this.reportFailure('Daily file logging failed', error, false); }
+    }
+    reportFailure(message, error, persist = true) {
+        const details = JSON.parse(this.redact(JSON.stringify(errorDetails(error))));
+        this.console.error(message, details);
+        // Never recurse into a failed file sink or send exporter errors back to OTLP.
+        if (persist) this.writeFile({ timestamp: this.clock().toISOString(), level: 'error', message, ...details });
     }
     logger(identity) {
         const sanitize = value => {
@@ -107,6 +125,6 @@ export class JobLogging {
     async close() {
         if (!this.provider) return;
         try { await this.provider.shutdown(); }
-        catch { this.console.error('Telemetry shutdown failed; inspect local logs'); }
+        catch (error) { this.reportFailure('Telemetry shutdown failed', error); }
     }
 }

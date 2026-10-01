@@ -6,3 +6,5 @@ config.*.json
 logs/
 app-config.local.json
 /jobs/
+yarn.lock
+.yarn
