@@ -1,4 +1,5 @@
 import { ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { errorDetails } from './job-logging.mjs';
 const logger = console;
 
 async function listS3Objects(s3Client, bucketName, prefix = '') {
@@ -21,7 +22,7 @@ async function listS3Objects(s3Client, bucketName, prefix = '') {
 
             continuationToken = response.NextContinuationToken;
         } catch (error) {
-            logger.error(`Error listing objects in bucket ${bucketName}:`, error);
+            logger.error(`Error listing objects in bucket ${bucketName} (${error.name})`);
             throw error;
         }
     } while (continuationToken);
@@ -61,14 +62,16 @@ async function deleteS3Objects(s3Client, bucketName, keys) {
                 deletionResults.failed.push(...response.Errors.map(error => ({
                     key: error.Key,
                     error: error.Message,
+                    ...(error.Code ? { error_code: error.Code } : {}),
                     bucket: bucketName
                 })));
             }
         } catch (error) {
-            logger.error(`Error during batch deletion in bucket ${bucketName}:`, error);
+            logger.error(`Error during batch deletion in bucket ${bucketName} (${error.name})`);
             deletionResults.failed.push(...chunk.map(key => ({
                 key,
                 error: error.message,
+                ...errorDetails(error),
                 bucket: bucketName
             })));
         }

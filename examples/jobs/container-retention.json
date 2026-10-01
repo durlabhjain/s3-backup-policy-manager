@@ -1,0 +1,13 @@
+{
+  "jobId": "dated-container-cleanup",
+  "policy": "azure-container-retention",
+  "provider": "azure",
+  "azure": { "connectionString": "vault:jobs/${environment}/container-cleanup:connectionString" },
+  "cron": "0 2 * * *",
+  "dryRun": true,
+  "deleteNonRetained": false,
+  "cleanupRules": [
+    { "prefix": "backup-daily-", "dateFormat": "yyyyMMdd", "retentionMonths": 3, "description": "Daily containers" },
+    { "prefix": "logs-", "dateFormat": "yyyyMM", "retentionMonths": 6, "description": "Monthly containers" }
+  ]
+}

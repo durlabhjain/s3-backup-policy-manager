@@ -1,0 +1,14 @@
+{
+  "vault": {
+    "address": "https://vault.example.com",
+    "engine": "kv",
+    "kvVersion": 2,
+    "environment": "production",
+    "tokenFile": "/run/vault-agent/token"
+  },
+  "settings": "vault:applications/${environment}/backup-manager",
+  "jobs": [
+    { "settings": "vault:jobs/${environment}/sql-backups" },
+    { "settings": "vault:jobs/${environment}/container-cleanup" }
+  ]
+}

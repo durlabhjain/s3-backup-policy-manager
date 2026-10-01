@@ -19,8 +19,13 @@ test('config lists, repeated arguments and globs preserve order and deduplicate 
     writeFileSync(first, JSON.stringify({ buckets: ['a'], dryRun: false }));
     writeFileSync(second, JSON.stringify([{ buckets: ['b'] }, { buckets: ['c'] }]));
     mkdirSync(join(directory, 'directory.json'));
-    const alias = join(directory, 'alias.json');
-    symlinkSync(first, alias);
+    let alias = join(directory, 'alias.json');
+    try { symlinkSync(first, alias); }
+    catch (error) {
+        if (process.platform !== 'win32' || error.code !== 'EPERM') throw error;
+        t.diagnostic('Windows cannot create symlinks; remaining selection/deduplication checks still run');
+        alias = first;
+    }
     const args = parseCliArgs([`config=${second},${first}`, `config=${directory}/*.json`, `config=${alias}`, 'dryRun=true']);
     assert.equal(args.config.length, 3);
     assert.deepEqual(resolveConfigs(args).map(c => c.buckets), [['b'], ['c'], ['a']]);
