@@ -21,7 +21,7 @@ async function listS3Objects(s3Client, bucketName, prefix = '') {
 
             continuationToken = response.NextContinuationToken;
         } catch (error) {
-            logger.error(`Error listing objects in bucket ${bucketName}:`, error);
+            logger.error(`Error listing objects in bucket ${bucketName} (${error.name})`);
             throw error;
         }
     } while (continuationToken);
@@ -65,7 +65,7 @@ async function deleteS3Objects(s3Client, bucketName, keys) {
                 })));
             }
         } catch (error) {
-            logger.error(`Error during batch deletion in bucket ${bucketName}:`, error);
+            logger.error(`Error during batch deletion in bucket ${bucketName} (${error.name})`);
             deletionResults.failed.push(...chunk.map(key => ({
                 key,
                 error: error.message,

@@ -12,6 +12,13 @@ import cron from 'node-cron';
 import BackupObject from "./backup-object.mjs";
 import FindBlobs from "./find-blobs.mjs";
 import ActionBase from "./action-base.mjs";
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
+import { loadApplicationConfig, mergeConfig, applicationDefaults } from './application-config.mjs';
+import { resolveVault, expandSettings } from './vault.mjs';
+import { JobLogging, secretRedactor, validateLogging } from './job-logging.mjs';
+import { processContainers, validateContainerPolicy } from './container-policy.mjs';
 
 const debug = false;
 
@@ -50,21 +57,21 @@ function loadConfig(selectedPath) {
     // An explicit file replaces both implicit config files and must exist.
     if (selectedPath !== undefined) {
         if (!selectedPath) throw new Error('config must specify a file path');
-        return JSON.parse(readFileSync(selectedPath, 'utf8'));
+        try { return JSON.parse(readFileSync(selectedPath, 'utf8')); } catch { throw new Error('Invalid configuration JSON'); }
     }
     let config = {};
 
     // Load base config
     const configPath = './config.json';
     if (existsSync(configPath)) {
-        const configFile = JSON.parse(readFileSync(configPath, 'utf8'));
+        let configFile; try { configFile = JSON.parse(readFileSync(configPath, 'utf8')); } catch { throw new Error('Invalid configuration JSON'); }
         config = { ...config, ...configFile };
     }
 
     // Load local config overrides
     const localConfigPath = './config.local.json';
     if (existsSync(localConfigPath)) {
-        const localConfigFile = JSON.parse(readFileSync(localConfigPath, 'utf8'));
+        let localConfigFile; try { localConfigFile = JSON.parse(readFileSync(localConfigPath, 'utf8')); } catch { throw new Error('Invalid local configuration JSON'); }
         if (Array.isArray(localConfigFile)) {
             config = localConfigFile.map(localConfigEntry => {
                 return { ...config, ...localConfigEntry }
@@ -364,12 +371,13 @@ async function processBackups(config, storageFactory = createStorage, {
     };
 
     try {
-        mkdirSync("output", { recursive: true });
+        const outputDirectory = config.outputDirectory || 'output';
+        mkdirSync(outputDirectory, { recursive: true });
         for (const bucketName of storageNames(config)) {
             output.log(`\nProcessing bucket: ${bucketName}`);
 
             try {
-                const listFilename = `output/${config.provider || "aws"}-${bucketName}.list.json`;
+                const listFilename = join(outputDirectory, `${config.provider || "aws"}-${bucketName}.list.json`);
                 let objects;
                 if (debug === true && existsSync(listFilename)) {
                     objects = JSON.parse(readFileSync(listFilename));
@@ -387,7 +395,7 @@ async function processBackups(config, storageFactory = createStorage, {
                 const analysisStarted = performance.now();
                 const result = applyRetentionPolicy(objects, config.retention, output);
                 output.log(`Retention analysis complete in ${((performance.now() - analysisStarted) / 1000).toFixed(1)}s`);
-                const parseReport = `output/${config.provider || 'aws'}-${bucketName}.parse-failures.json`;
+                const parseReport = join(outputDirectory, `${config.provider || 'aws'}-${bucketName}.parse-failures.json`);
                 writeFileSync(parseReport, JSON.stringify(result.parseFailures, null, 2));
                 if (result.parseFailures.length) {
                     output.error(`ATTENTION: ${result.parseFailures.length} file(s) could not be parsed and are PROTECTED from deletion. Review ${parseReport}`);
@@ -400,7 +408,7 @@ async function processBackups(config, storageFactory = createStorage, {
                     protectedParseFailures: result.summary.parseFailureCount
                 });
                 output.log('Deletion overview: counts are files to delete / total parsed files (multipart files count separately).');
-                const candidateReport = `output/${config.provider || 'aws'}-${bucketName}.deletion-candidates.json`;
+                const candidateReport = join(outputDirectory, `${config.provider || 'aws'}-${bucketName}.deletion-candidates.json`);
                 writeFileSync(candidateReport, JSON.stringify(result.backupsToDelete, null, 2));
                 output.log(`Full deletion candidate list: ${candidateReport}`);
                 const reviewed = await showDeletionOverview(result.deletionOverview, { scheduled, output, review });
@@ -460,7 +468,7 @@ async function processBackups(config, storageFactory = createStorage, {
                 allResults.totalSummary.parseFailureCount += result.summary.parseFailureCount;
 
             } catch (error) {
-                output.error(`Error processing bucket ${bucketName}:`, error);
+                output.error(`Error processing bucket ${bucketName} (${error.name})`);
                 allResults.byBucket[bucketName] = { error: error.message };
             }
         }
@@ -473,14 +481,15 @@ async function processBackups(config, storageFactory = createStorage, {
 }
 
 async function prune(config, options) {
+    const output = options?.output || logger;
     const finalTable = [];
 
     const results = await processBackups(config, createStorage, options);
 
-    logger.log('\nTotal Summary:', results.totalSummary);
+    output.log('\nTotal Summary:', results.totalSummary);
 
     if (config.dryRun && config.deleteNonRetained) {
-        logger.log('\nTo perform actual deletions, set dryRun: false in your config');
+        output.log('\nTo perform actual deletions, set dryRun: false in your config');
     }
 
     for (const bucket in results.byBucket) {
@@ -498,31 +507,21 @@ async function prune(config, options) {
         }
     }
 
-    return { finalTable, reviewStopped: results.reviewStopped };
-}
-
-class PruneBackup extends ActionBase {
-    async run(config) {
-        logger.info('Configuration loaded:', {
-            provider: config.provider, containers: storageNames(config),
-            prefix: config.prefix, retention: config.retention,
-            dryRun: config.dryRun, deleteNonRetained: config.deleteNonRetained
-        });
-
-        cron.schedule(config.cron, async () => {
-            const title = `${config.provider} - ${storageNames(config).join(',')}`
-            logger.info(`Running ${title}....`);
-            if (config.dryRun) {
-                logger.debug('DRY RUN MODE - No deletions will be performed');
-            }
-            try {
-                await prune(config, { scheduled: true });
-            } catch (err) {
-                logger.error(err);
-            }
-        });
+    const statistics = { objects_eligible: results.totalSummary.deleteCount, objects_deleted: 0,
+        objects_scanned: results.totalSummary.retainedCount + results.totalSummary.deleteCount + results.totalSummary.parseFailureCount,
+        objects_retained: results.totalSummary.retainedCount, objects_would_delete: 0, objects_failed: 0, targets_failed: 0, parse_failure_count: results.totalSummary.parseFailureCount };
+    for (const result of Object.values(results.byBucket)) {
+        if (result.error) statistics.targets_failed++;
+        statistics.objects_deleted += result.deletionResult?.successful.length || 0;
+        statistics.objects_failed += result.deletionResult?.failed.length || 0;
+        if (config.dryRun !== false || config.deleteNonRetained !== true) statistics.objects_would_delete += result.summary?.deleteCount || 0;
     }
-};
+    const cancelled = results.reviewStopped || (config.dryRun === false && config.deleteNonRetained === true &&
+        Object.values(results.byBucket).some(result => result.backupsToDelete?.length && !result.deletionResult));
+    return { finalTable, reviewStopped: results.reviewStopped, statistics,
+        outcome: statistics.targets_failed === Object.keys(results.byBucket).length && statistics.targets_failed ? 'failed' :
+            statistics.targets_failed || statistics.objects_failed ? 'partial_failure' : cancelled ? 'cancelled' : 'success' };
+}
 
 class PruneOnce extends ActionBase {
     async run(config) {
@@ -546,7 +545,7 @@ class GenerateSignedUrls extends ActionBase {
 
 const modes = {
     prune: PruneOnce,
-    schedulePrune: PruneBackup,
+    schedulePrune: PruneOnce,
     findBlobs: FindBlobs,
     generateSignedUrls: GenerateSignedUrls
 };
@@ -597,7 +596,7 @@ function resolveConfigFiles(selection) {
     return [...files];
 }
 
-function resolveConfigs(args) {
+function resolveConfigs(args, jobDefaults, raw = false) {
     const overrides = {};
     if (args.dryRun !== undefined) {
         if (!['true', 'false'].includes(args.dryRun)) {
@@ -621,37 +620,141 @@ function resolveConfigs(args) {
         if (!config || typeof config !== 'object' || Array.isArray(config)) {
             throw new Error('Configuration must be an object or an array of objects');
         }
-        return { ...defaultConfig, ...config, ...overrides };
+        if (raw) return { ...config, ...overrides };
+        return jobDefaults === undefined ? { ...defaultConfig, ...config, ...overrides } :
+            { ...mergeConfig(mergeConfig(defaultConfig, jobDefaults), config), ...overrides };
     });
 }
 
 async function main(argv = process.argv.slice(2)) {
     const args = parseCliArgs(argv);
+    if (args.dryRun !== undefined && !['true', 'false'].includes(args.dryRun)) throw new Error('dryRun must be true or false');
 
     const { mode = "findBlobs", ...options } = args;
 
-    if (!modes[mode]) {
+    if (!modes[mode] && mode !== 'listContainers') {
         throw new Error(`Invalid mode: ${mode}`);
     }
 
-    const configs = resolveConfigs(args);
+    const rawApp = loadApplicationConfig(args.appConfig, args.appConfig !== undefined);
+    if (JSON.stringify(rawApp.vault || {}).includes('vault:')) throw new Error('Vault bootstrap settings cannot contain secret references');
+    const app = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault)));
+    validateLogging(app);
+    const applicationJobs = args.config === undefined && app.jobs !== undefined;
+    const sources = applicationJobs ? rawApp.jobs || app.jobs : resolveConfigs(args, undefined, true);
+    if (!Array.isArray(sources) || !sources.length) throw new Error('Jobs must be a nonempty array');
+    const resolveJob = async (source, currentApp) => {
+        const resolved = expandSettings(await resolveVault(source, rawApp.vault));
+        // Preserve legacy shallow merges unless application defaults or Vault settings are used.
+        const config = source.settings !== undefined || Object.keys(currentApp.jobDefaults || {}).length ?
+            mergeConfig(mergeConfig(defaultConfig, currentApp.jobDefaults), resolved) : { ...defaultConfig, ...resolved };
+        if (args.dryRun !== undefined) config.dryRun = args.dryRun === 'true';
+        return config;
+    };
+    const configs = [];
+    for (const source of sources) configs.push(await resolveJob(source, app));
+    function validateBackupJob(config) {
+        if (!['aws', 'azure'].includes(config.provider)) throw new Error('Unsupported provider');
+        const targets = storageNames(config);
+        if (!Array.isArray(targets) || !targets.length) throw new Error('No buckets/containers configured. Please check your config files.');
+        if (targets.some(target => typeof target !== 'string' || !target || /[\\/]/.test(target))) throw new Error('Invalid bucket/container name');
+        const retention = { ...defaultConfig.retention, ...config.retention };
+        retention.logBackups ??= retention.differentialBackups;
+        if (Object.values(retention).some(value => !Number.isInteger(value) || value < 0)) throw new Error('Invalid retention limit');
+    }
+    const ids = new Set();
 
-    for (const config of configs) {
-        if (storageNames(config).length === 0) {
-            throw new Error('No buckets/containers configured. Please check your config files.');
-        }
+    for (const [index, config] of configs.entries()) {
+        const explicitId = config.jobId;
+        config.jobId ||= `legacy-${config.provider}-${index + 1}`;
+        if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(config.jobId) || ids.has(config.jobId)) throw new Error('jobId must be unique and contain only letters, digits, underscore or dash');
+        ids.add(config.jobId);
+        config.policy ||= 'sql-backup-retention';
+        if (!['sql-backup-retention', 'azure-container-retention'].includes(config.policy)) throw new Error('Invalid job policy');
+        if (typeof config.dryRun !== 'boolean' || typeof config.deleteNonRetained !== 'boolean') throw new Error('Job deletion settings must be booleans');
+        config.outputDirectory = explicitId ? join(app.outputDirectory || 'output', config.jobId) : (app.outputDirectory || 'output');
+        if (config.policy === 'azure-container-retention') {
+            validateContainerPolicy(config);
+            if (!['prune', 'schedulePrune', 'listContainers'].includes(mode)) throw new Error('Container policy supports prune, schedulePrune and listContainers');
+        } else if (mode === 'listContainers') throw new Error('listContainers requires a container retention job');
+        else validateBackupJob(config);
         if (mode === 'schedulePrune' && !cron.validate(config.cron)) {
             throw new Error(`Invalid cron schedule: ${config.cron}`);
         }
     }
-    const action = new modes[mode](options);
+    const active = new Map();
+    const tasks = [];
+    const run = config => {
+        if (active.has(config.jobId)) {
+            console.warn('Skipped overlapping scheduled execution:', config.jobId);
+            return Promise.resolve();
+        }
+        const execution = (async () => {
+            const runId = randomUUID(), started = performance.now();
+            let currentApp, currentConfig, logging;
+            try {
+                currentApp = applicationDefaults(expandSettings(await resolveVault(rawApp, rawApp.vault)));
+                currentConfig = await resolveJob(applicationJobs ? (rawApp.jobs || currentApp.jobs)[configs.indexOf(config)] : sources[configs.indexOf(config)], currentApp);
+                if ((currentConfig.jobId || config.jobId) !== config.jobId || (currentConfig.policy || 'sql-backup-retention') !== config.policy || currentConfig.provider !== config.provider)
+                    throw new Error('Job identity, provider or policy changed; restart required');
+                if (typeof currentConfig.dryRun !== 'boolean' || typeof currentConfig.deleteNonRetained !== 'boolean') throw new Error('Job deletion settings must be booleans');
+                currentConfig.jobId = config.jobId; currentConfig.policy = config.policy; currentConfig.outputDirectory = config.outputDirectory;
+                if (currentConfig.policy === 'azure-container-retention') validateContainerPolicy(currentConfig);
+                else validateBackupJob(currentConfig);
+                logging = new JobLogging(currentApp, { redact: secretRedactor([currentApp, currentConfig]) });
+            } catch (error) {
+                // Vault failures cannot export using credentials that could not be resolved.
+                const bootstrap = new JobLogging({ logging: app.logging, telemetry: { enabled: false } });
+                bootstrap.logger({ job_id: config.jobId, run_id: runId }).event('run_completed', { outcome: 'failed', mode: 'startup', error_type: error.name, duration_ms: Math.round(performance.now() - started) });
+                if (mode !== 'schedulePrune') process.exitCode = 1;
+                return { outcome: 'failed' };
+            }
+            const identity = { run_id: runId, job_id: config.jobId, environment: currentConfig.environment || currentApp.environment || 'development',
+                mode: mode === 'listContainers' ? 'list' : ['prune', 'schedulePrune'].includes(mode) ? currentConfig.dryRun !== false || currentConfig.deleteNonRetained !== true ? 'dry_run' : 'execute' : mode,
+                policy: config.policy, provider: config.provider, host_name: hostname() };
+            const output = logging.logger(identity);
+            output.event('run_started', { started_at: new Date().toISOString() });
+            let result, errorType;
+            try {
+                if (config.policy === 'azure-container-retention') result = await processContainers(currentConfig, {
+                    output, scheduled: mode === 'schedulePrune', confirm: confirmDeletion, list: mode === 'listContainers'
+                });
+                else if (['prune', 'schedulePrune'].includes(mode)) result = await prune(currentConfig, { output, scheduled: mode === 'schedulePrune' });
+                else {
+                    const action = new modes[mode]({ ...options, logger: output });
+                    try { result = await action.run(currentConfig, args); } finally { await action.cleanup(); }
+                }
+                result ||= { outcome: 'success', statistics: {} };
+            } catch (error) { errorType = error.name; result = { outcome: 'failed', statistics: {} }; output.error('Job failed (%s)', errorType); }
+            finally {
+                output.event('run_completed', { outcome: result.outcome || 'success', duration_ms: Math.round(performance.now() - started),
+                    ...result.statistics, ...(errorType ? { error_type: errorType } : {}) });
+                await logging.close();
+            }
+            if (mode !== 'schedulePrune' && ['failed', 'partial_failure'].includes(result.outcome)) process.exitCode = 1;
+            return result;
+        })();
+        active.set(config.jobId, execution);
+        return execution.finally(() => active.delete(config.jobId));
+    };
+    let shutdown;
     try {
+        if (mode === 'schedulePrune') {
+            for (const config of configs) tasks.push(cron.schedule(config.cron, () => run(config)));
+            shutdown = async () => {
+                for (const task of tasks) task?.stop();
+                await Promise.allSettled([...active.values()]);
+                process.removeListener('SIGINT', shutdown); process.removeListener('SIGTERM', shutdown);
+            };
+            process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
+            return;
+        }
         for (const config of configs) {
-            const result = await action.run(config, args);
+            const result = await run(config);
             if (result?.reviewStopped) break;
         }
     } finally {
-        await action.cleanup();
+        if (mode === 'schedulePrune' && !shutdown) for (const task of tasks) task?.stop();
     }
 }
 

@@ -4,6 +4,70 @@ Inspect SQL backup files, apply retention rules, search object names, and genera
 
 Requires Node.js 22+ and npm or Yarn. Install with `npm install`; run tests with `npm test`.
 
+## Application settings and independent jobs
+
+`app-config.json` contains process settings: console/file logging, log retention, OTLP/OpenObserve, Vault bootstrap settings, output directory, and optional `jobDefaults`. Storage targets, credentials/references, schedules, policies, and **data retention** belong to jobs. The checked-in application config enables local UTC daily JSONL logs with 30-day retention; remote telemetry is disabled. Missing implicit `app-config.json` preserves the existing console-only behavior. An explicit `appConfig=` file must exist.
+
+```bash
+# Preview all selected jobs
+node index.mjs appConfig=./app-config.json 'config=./jobs/*.json' mode=prune dryRun=true
+
+# Schedule each job independently, without an immediate cleanup
+node index.mjs appConfig=./app-config.json 'config=./jobs/*.json' mode=schedulePrune
+
+# Inventory Azure containers and their observed blob counts/bytes
+node index.mjs appConfig=./app-config.json config=./jobs/containers.json mode=listContainers
+```
+
+See [example job files](examples/jobs) and [Vault-only bootstrap](examples/vault-bootstrap.json). Examples contain placeholders, not credentials. Keep deployment job files outside source control; the root `jobs/` directory and `app-config.local.json` are ignored.
+
+Jobs use `policy: "sql-backup-retention"` (default) or `policy: "azure-container-retention"`. A stable, unique `jobId` containing letters/digits/dash/underscore scopes reports to `<outputDirectory>/<jobId>/`. Legacy configurations without IDs keep their original output paths and receive positional telemetry IDs; assign explicit IDs for production monitoring. Identical provider/container names in different named jobs no longer overwrite each other's reports.
+
+When `jobDefaults` is nonempty, configuration precedence is built-in defaults → application job defaults → job → CLI `dryRun`. Nested objects merge recursively; arrays replace rather than concatenate, and `null` explicitly replaces a value. Existing configurations without application defaults or whole-job Vault settings retain their shallow override behavior. Shared defaults cannot set `dryRun: false` or `deleteNonRetained: true`: authorize deletion in each job. Both flags remain necessary for deletion; interactive pruning requires terminal confirmation, and scheduled pruning executes without confirmation.
+
+Container jobs require `provider: "azure"`, account-level credentials, and a nonempty `cleanupRules` array. Each rule supplies `prefix`, `dateFormat` (`yyyyMMdd` or `yyyyMM`), and nonnegative integer `retentionMonths` (maximum 1200). An optional dash/underscore after the prefix is accepted. Monthly dates mean the first day of the month. Retention compares strict container-name dates against UTC now minus calendar months, clamping month ends. The first rule whose prefix and date successfully parse wins. Unmatched/invalid-date containers are protected. A complete container enumeration precedes deletion, so a failed page never deletes a partial candidate list. **Deleting a container deletes all its contents, irrespective of SQL backup retention.** Container-specific SAS URLs cannot enumerate the account; use a service SAS or connection string/account credentials.
+
+Scheduled execution skips a tick if that job is still running. This guard applies within one process; run only one scheduler instance per deployment. Different jobs may run concurrently. SIGINT/SIGTERM stop schedules, wait for active jobs, and flush telemetry. Storage requests retain SDK retry behavior; graceful shutdown may wait for storage. Failed jobs are isolated so later jobs continue. One-shot fatal/partial failures set exit code 1; stopped review/declined confirmation produces `cancelled` rather than claiming success.
+
+## Vault and credential rotation
+
+Any job/application value can reference `vault:<path>:<field>`; omit `:<field>` to resolve a whole object. `${environment}` in a reference uses `vault.environment`. KV v1/v2, nested references, native JSON objects, and JSON object/array strings are supported. An optional `settings` reference supplies the whole application/job body; explicit local fields override it recursively. The application can declare a `jobs` array instead of local job files. Explicit `config=` selections take precedence over that array.
+
+```json
+{
+  "vault": {
+    "address": "https://vault.example.com",
+    "engine": "kv",
+    "kvVersion": 2,
+    "environment": "production",
+    "tokenFile": "/run/vault-agent/token"
+  },
+  "settings": "vault:applications/${environment}/backup-manager",
+  "jobs": [
+    { "settings": "vault:jobs/${environment}/sql-backups" },
+    { "settings": "vault:jobs/${environment}/container-cleanup" }
+  ]
+}
+```
+
+The application secret contains normal application settings; each job secret contains a normal job object including `jobId`, `provider`, `policy`, `cron`, and storage credentials or additional references. A SAS URL can be stored directly under `azure.sasUrl` in the job secret, or referenced individually. No storage or OpenObserve secrets need to be present on the deployment filesystem.
+
+Vault references are resolved at startup for validation, and **again before every job run**, including application telemetry authorization and job defaults. Values are cached only within one resolution call and never written as configuration files. Existing runs keep their initial credential snapshot; the next run uses rotated secrets. The token file is reread on each lookup/resolution. Files and job membership are loaded at startup; schedule, job identity, provider, and policy changes require restarting. Changed identity/provider/policy refuses execution until restart. Storage targets, retention, deletion flags, and credentials in Vault can change on the next run; protect write access to those secrets accordingly.
+
+Bootstrap precedence is `VAULT_ADDR` over `vault.address`, and `VAULT_TOKEN` over `VAULT_TOKEN_FILE`/`vault.tokenFile` over `vault.token`. Prefer a dedicated service account with Vault Agent using your deployment's workload authentication and a restricted token sink file. This program consumes the token and does not perform AppRole login or token renewal itself. Grant only read access to the required secret paths; use Vault policies, short-lived tokens, audit logging, and OS permissions on the bootstrap config/token file. Environment variables also require access controls and are not an encrypted secret store. Reference paths/field names are not credentials, though they may reveal deployment structure.
+
+Vault bootstrap settings cannot themselves contain Vault references. HTTPS verification remains enabled; HTTP is allowed only for loopback fixtures. Requests have five-second deadlines and redirects are rejected. Missing secrets, cycles, malformed settings, or lookup failure stop the affected run before storage access. Early startup failures remain on the console; failures during scheduled refresh also emit a local terminal event. Receiver-side missed-run monitoring catches failures that cannot authenticate to the receiver.
+
+## Logs and OpenObserve notifications
+
+Set `telemetry.enabled`, the full OTLP/HTTP JSON logs `telemetry.endpoint`, `telemetry.authorization` (complete header value, typically a Vault reference), and `telemetry.stream` in the application settings. The standard OpenTelemetry SDK/exporter sends logs; no application SMTP client is used. Configure email notifications in OpenObserve. See [alert/deployment guidance](docs/telemetry-alerts.md).
+
+Each run emits correlated `run_started` and `run_completed` events with `run_id`, `job_id`, environment, mode (`execute`, `dry_run`, `list`, or another CLI mode), policy/provider, host, duration, and outcome (`success`, `partial_failure`, `failed`, `cancelled`). Lifecycle events bypass the configured minimum console/file log level. SQL statistics distinguish candidates, actual successful/failed deletes, target failures, and protected parse failures. Container statistics distinguish scanned/eligible/deleted/would-delete/failed/skipped containers; inventory adds measured `blobs_observed`/`bytes_observed`. Container deletion does not claim measured blob deletion counts or reclaimed bytes. Parse failures are protected and counted, without making otherwise completed work a failed deletion.
+
+File logs are synchronous JSONL appends in `logging.file.directory`, named `s3-backup-policy-manager-YYYY-MM-DD.jsonl`, rotated in UTC. Retention removes only regular files with this exact valid-date naming pattern; unrelated files and symlinks are preserved. Today's file plus the previous `retentionDays - 1` calendar dates are kept. Disk errors do not interrupt cleanup. Known configured credentials and SAS signatures are redacted from the shared logger. Download URL generation intentionally prints the requested signed URL to the console; treat that output as a credential.
+
+Remote export is best effort. Queue capacity is 2048 records, batches are at most 512, and each export has a configurable 1–30 second timeout (default 5). Jobs flush/shut down their exporter after completion; receiver rejection or timeouts do not change storage results. For very verbose jobs the bounded queue can drop records: local summaries and receiver absence alerts remain necessary.
+
 ## Supported backup paths
 
 Both patterns are detected automatically on either provider. Paths use `/`; backup types are case-insensitive.

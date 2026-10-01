@@ -1,0 +1,18 @@
+{
+  "environment": "development",
+  "logging": {
+    "level": "info",
+    "file": { "enabled": true, "directory": "logs", "retentionDays": 30 }
+  },
+  "telemetry": {
+    "enabled": false,
+    "endpoint": "https://openobserve.example.com/api/organization/v1/logs",
+    "authorization": "",
+    "stream": "backup_jobs",
+    "serviceName": "s3-backup-policy-manager",
+    "timeoutSeconds": 5
+  },
+  "outputDirectory": "output",
+  "vault": { "address": "", "engine": "kv", "kvVersion": 2, "environment": "development" },
+  "jobDefaults": {}
+}

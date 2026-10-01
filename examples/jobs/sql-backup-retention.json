@@ -1,0 +1,12 @@
+{
+  "jobId": "sql-backups",
+  "policy": "sql-backup-retention",
+  "provider": "azure",
+  "azure": { "sasUrl": "vault:jobs/${environment}/sql-backups:sasUrl" },
+  "containers": ["sql-backups"],
+  "prefix": "",
+  "cron": "0 3 * * *",
+  "dryRun": true,
+  "deleteNonRetained": false,
+  "retention": { "yearlyBackups": 1, "monthlyBackups": 12, "weeklyBackups": 4, "fullBackups": 1, "differentialBackups": 7, "logBackups": 7 }
+}
