@@ -685,7 +685,7 @@ async function main(argv = process.argv.slice(2)) {
             throw new Error(`Invalid cron schedule: ${config.cron}`);
         }
     }
-    const active = new Map();
+    const active = new Map(), running = new Map();
     const tasks = [];
     const run = config => {
         if (active.has(config.jobId)) {
@@ -718,6 +718,7 @@ async function main(argv = process.argv.slice(2)) {
                 policy: config.policy, provider: config.provider, host_name: hostname() };
             const output = logging.logger(identity);
             output.event('run_started', { started_at: new Date().toISOString() });
+            running.set(config.jobId, { output, logging, started });
             let result, failure;
             try {
                 if (config.policy === 'azure-container-retention') result = await processContainers(currentConfig, {
@@ -731,6 +732,7 @@ async function main(argv = process.argv.slice(2)) {
                 result ||= { outcome: 'success', statistics: {} };
             } catch (error) { failure = errorDetails(error); result = { outcome: 'failed', statistics: {} }; output.error('Job failed: %s', JSON.stringify(failure)); }
             finally {
+                running.delete(config.jobId);
                 output.event('run_completed', { outcome: result.outcome || 'success', duration_ms: Math.round(performance.now() - started),
                     ...result.statistics, ...failure });
                 await logging.close();
@@ -741,7 +743,7 @@ async function main(argv = process.argv.slice(2)) {
         active.set(config.jobId, execution);
         return execution.finally(() => active.delete(config.jobId));
     };
-    let shutdown;
+    let shutdown, interrupt;
     try {
         if (mode === 'schedulePrune') {
             for (const config of configs) tasks.push(cron.schedule(config.cron, () => run(config)));
@@ -753,11 +755,21 @@ async function main(argv = process.argv.slice(2)) {
             process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
             return;
         }
+        // A signal would otherwise kill the process before run_completed is emitted and the OTLP batch is flushed.
+        interrupt = async signal => {
+            for (const { output, logging, started } of running.values()) {
+                output.event('run_completed', { outcome: 'interrupted', signal, duration_ms: Math.round(performance.now() - started) });
+                await logging.close();
+            }
+            process.exit(signal === 'SIGINT' ? 130 : 143);
+        };
+        process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
         for (const config of configs) {
             const result = await run(config);
             if (result?.reviewStopped) break;
         }
     } finally {
+        if (interrupt) { process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt); }
         if (mode === 'schedulePrune' && !shutdown) for (const task of tasks) task?.stop();
     }
 }

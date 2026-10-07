@@ -28,6 +28,8 @@ export function validateLogging(app) {
     let url; try { url = new URL(telemetry.endpoint); } catch { throw new Error('Telemetry endpoint is required'); }
     if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) || url.username || url.password || url.search || url.hash)
         throw new Error('Telemetry endpoint must be HTTPS (loopback HTTP allowed)');
+    // Generic JSON ingest (/_json) stores the OTLP payload as one unflattened field.
+    if (!url.pathname.endsWith('/v1/logs')) throw new Error('Telemetry endpoint must be the OTLP logs path ending in /v1/logs (e.g. /api/<org>/v1/logs), not /_json');
     if (typeof telemetry.authorization !== 'string' || !telemetry.authorization || /[\r\n]/.test(telemetry.authorization)) throw new Error('Telemetry authorization header is required');
     if (!/^[A-Za-z0-9_]+$/.test(telemetry.stream || 'backup_jobs')) throw new Error('Invalid telemetry stream');
     if (!Number.isInteger(telemetry.timeoutSeconds ?? 5) || (telemetry.timeoutSeconds ?? 5) < 1 || (telemetry.timeoutSeconds ?? 5) > 30) throw new Error('Telemetry timeoutSeconds must be 1..30');
